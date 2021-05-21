@@ -51,6 +51,7 @@
 
 #include "access/transam.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_inherits_fn.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "nodes/nodeFuncs.h"
@@ -69,6 +70,7 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbutil.h"
+#include "cdb/cdbpartition.h"
 
 /*
  * We must skip "overhead" operations that involve database access when the
@@ -1661,9 +1663,40 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 				else
 					lockmode = AccessShareLock;
 				if (acquire)
+				{
 					LockRelationOid(rte->relid, lockmode);
+
+					/*
+					 * If the relation is partitioned, we should acquire corresponding locks
+					 * of each leaf partition before entering InitPlan.
+					 */
+					if (rel_is_partitioned(rte->relid) && (parsetree->commandType == CMD_INSERT
+					|| parsetree->commandType == CMD_UPDATE || parsetree->commandType == CMD_DELETE))
+					{
+						if (parsetree->commandType == CMD_INSERT)
+							lockmode = RowExclusiveLock;
+						else
+							lockmode = ExclusiveLock;
+						find_all_inheritors(rte->relid, lockmode, NULL);
+					}
+				}
 				else
+				{
 					UnlockRelationOid(rte->relid, lockmode);
+
+					/*
+					 * If we need to release lock, we also need release leaf patition lock.
+					 */
+					if (rel_is_partitioned(rte->relid) && (parsetree->commandType == CMD_INSERT
+					|| parsetree->commandType == CMD_UPDATE || parsetree->commandType == CMD_DELETE))
+					{
+						ListCell   *child;
+						List       *children;
+						children = find_all_inheritors(rte->relid, NoLock, NULL);
+						for (child = lnext(list_head(child)); child != NULL; child = lnext(child))
+							UnlockRelationOid(lfirst_oid(child), lockmode);
+					}
+				}
 				break;
 
 			case RTE_SUBQUERY:

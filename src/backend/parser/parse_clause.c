@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "catalog/pg_inherits_fn.h"
 #include "catalog/heap.h"
 #include "catalog/pg_exttable.h"
 #include "catalog/pg_operator.h"
@@ -328,6 +329,7 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 	 * parserOpenTable upgrades the lock to Exclusive mode for distributed
 	 * tables.
 	 */
+	bool lockUpgraded = false;
 	if (pstate->p_is_insert && !pstate->p_is_update)
 	{
 		setup_parser_errposition_callback(&pcbstate, pstate, relation->location);
@@ -336,8 +338,22 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 	}
 	else
 	{
+		pstate->p_target_relation = parserOpenTable(pstate, relation, RowExclusiveLock, &lockUpgraded);
+	}
 
-		pstate->p_target_relation = parserOpenTable(pstate, relation, RowExclusiveLock, NULL);
+	/* If the relation is partitioned, we should acquire corresponding locks
+	 * on each leaf partition before entering InitPlan.
+	 */
+
+	Oid relid = RangeVarGetRelid(relation, NoLock, true);
+	if (rel_is_partitioned(relid))
+	{
+		LOCKMODE lockmode;
+		if (lockUpgraded)
+			lockmode = ExclusiveLock;
+		else
+			lockmode = RowExclusiveLock;
+		find_all_inheritors(relid, lockmode, NULL);
 	}
 
 	/*
